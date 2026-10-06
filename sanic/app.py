@@ -58,6 +58,7 @@ from sanic.exceptions import (
     URLBuildError,
 )
 from sanic.handlers import ErrorHandler
+from sanic.handlers.policy import ERROR_POLICY_HEADER, ErrorPolicyVersion
 from sanic.helpers import Default, _default
 from sanic.http import Stage
 from sanic.log import LOGGING_CONFIG_DEFAULTS, error_logger, logger
@@ -464,16 +465,120 @@ class Sanic(
         self,
         handler: FutureException,
         route_names: list[str] | None = None,
+        *,
+        layer: str = "app",
     ):
         """项目内部接口说明。"""
 
         for exception in handler.exceptions:
             if isinstance(exception, (tuple, list)):
                 for e in exception:
-                    self.error_handler.add(e, handler.handler, route_names)
+                    self.error_handler.add(
+                        e, handler.handler, route_names, layer=layer
+                    )
             else:
-                self.error_handler.add(exception, handler.handler, route_names)
+                self.error_handler.add(
+                    exception,
+                    handler.handler,
+                    route_names,
+                    layer=layer,
+                )
         return handler.handler
+
+    # ------------------------------------------------------------------ #
+    # 异常映射策略版本
+    # ------------------------------------------------------------------ #
+    def publish_error_policy(
+        self,
+        version_id: str | None = None,
+        *,
+        activate: bool = True,
+    ) -> ErrorPolicyVersion:
+        """把当前应用、蓝图、路由三层异常映射发布为一个不可变版本。
+
+        版本在发布瞬间冻结当前全部映射；之后新增的映射不影响已发布
+        版本，需要再次发布。默认立即激活，新受理的请求固定该版本。
+        """
+        return self.error_handler.publish_policy(version_id, activate=activate)
+
+    def activate_error_policy(self, version_id: str) -> ErrorPolicyVersion:
+        """激活某个已发布版本；只影响激活之后受理的请求。"""
+        return self.error_handler.activate_policy(version_id)
+
+    def rollback_error_policy(self) -> ErrorPolicyVersion | None:
+        """回滚到上一个激活版本；无历史可回滚时返回 ``None``。"""
+        return self.error_handler.rollback_policy()
+
+    def add_error_mapping(
+        self,
+        exception: type[BaseException],
+        status_code: int,
+        *,
+        blueprints: list[str] | None = None,
+        routes: list[str] | None = None,
+        replace: bool = False,
+    ) -> None:
+        """为异常类型登记一个状态码映射。
+
+        ``routes`` 命中时为路由级规则，否则 ``blueprints`` 命中时为
+        蓝图级规则，都未给出时为应用级规则。优先级为
+        路由 > 蓝图 > 应用。``replace=True`` 用于热更新：先移除同一
+        层、同一作用域上的旧映射再登记，已发布版本与在途请求不受影响；
+        登记后需要重新发布版本才对新受理的请求生效。未配置版本的项目
+        则按原查找顺序即时生效。
+        """
+        from sanic.handlers.error import status_mapping
+
+        handler = status_mapping(status_code)
+        kwargs: dict[str, Any] = {"replace": replace}
+        if routes:
+            route_names = self._resolve_route_names(routes)
+            self.error_handler.add(
+                exception, handler, route_names, layer="route", **kwargs
+            )
+        elif blueprints:
+            route_names = self._blueprint_route_names(blueprints)
+            self.error_handler.add(
+                exception,
+                handler,
+                route_names,
+                layer="blueprint",
+                **kwargs,
+            )
+        else:
+            self.error_handler.add(exception, handler, layer="app", **kwargs)
+
+    def _resolve_route_names(self, routes: list[str]) -> list[str]:
+        # 接受完整路由名（app.bp.handler）或其任意唯一后缀
+        # （bp.handler / handler）
+        all_names = [route.name for route in self.router.routes]
+        resolved: list[str] = []
+        for given in routes:
+            if given in all_names:
+                resolved.append(given)
+                continue
+            suffix = f".{given}"
+            matches = [
+                n for n in all_names if n == given or n.endswith(suffix)
+            ]
+            if not matches:
+                raise SanicException(f"No route matches {given!r}")
+            resolved.extend(matches)
+        return resolved
+
+    def _blueprint_route_names(self, blueprints: list[str]) -> list[str]:
+        wanted = set(blueprints)
+        prefix = f"{self.name}."
+        route_names: list[str] = []
+        for route in self.router.routes:
+            owner = getattr(route, "name", "")
+            if owner.startswith(prefix):
+                owner = owner[len(prefix) :]
+            # 去掉应用名前缀后，蓝图名是第一段
+            owner_bp = owner.split(".", 1)[0] if "." in owner else None
+            if owner_bp in wanted:
+                route_names.append(route.name)
+        return route_names
 
     def _apply_listener(self, listener: FutureListener):
         return self.register_listener(
@@ -876,8 +981,21 @@ class Sanic(
                 "has at least partially been sent."
             )
 
-            handler = self.error_handler._lookup(
-                exception, request.name if request else None
+            policy = self.error_handler.request_policy(request)
+            handler, scope = self.error_handler.resolve(
+                exception, request.name if request else None, policy
+            )
+            # 确定结果：响应头已提交，状态码不可更改；按受理时固定的
+            # 版本解析处理器但不发送其结果，仅留下审计与告警。
+            self.error_handler.audit(
+                request,
+                policy,
+                reason="response-committed",
+                scope=scope or "default",
+                handler=getattr(handler, "__name__", None),
+                exception=type(exception).__name__,
+                status=None,
+                suppressed=True,
             )
             if handler:
                 logger.warning(
@@ -911,6 +1029,7 @@ class Sanic(
                 return await self.handle_exception(request, e, False)
         # No middleware results
         if not response:
+            fallback_policy = self.error_handler.request_policy(request)
             try:
                 response = self.error_handler.response(request, exception)
                 if isawaitable(response):
@@ -930,6 +1049,18 @@ class Sanic(
                     response = HTTPResponse(
                         "An error occurred while handling an error", status=500
                     )
+                # 兜底路径同样固定到受理版本，保证响应与审计一致
+                self.error_handler.audit(
+                    request,
+                    fallback_policy,
+                    reason="error-pipeline-failed",
+                    scope="default",
+                    exception=type(exception).__name__,
+                    failure=type(e).__name__,
+                    status=500,
+                )
+                if fallback_policy is not None:
+                    response.headers[ERROR_POLICY_HEADER] = fallback_policy.id
         if response is not None:
             try:
                 request.reset_response()

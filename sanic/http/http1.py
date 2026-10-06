@@ -249,6 +249,8 @@ class Http(Stream, metaclass=TouchUpMeta):
             app=self.protocol.app,
         )
         self.protocol.request_class._current.set(request)
+        # 请求受理时固定异常映射策略版本；在途热更新或回滚不会改变它
+        self.protocol.app.error_handler.request_policy(request)
         await self.dispatch(
             "http.lifecycle.request",
             inline=True,

@@ -162,6 +162,7 @@ class ASGIApp:
             sanic_app,
         )
         request_class._current.set(instance.request)
+        sanic_app.error_handler.request_policy(instance.request)
         instance.request.stream = instance  # type: ignore
         instance.request_body = True
         instance.request.conn_info = ConnInfo(instance.transport)

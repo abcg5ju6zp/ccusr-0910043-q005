@@ -326,6 +326,8 @@ class Http3:
             request = self._make_request(event)
             receiver = HTTPReceiver(self.transmit, self.protocol, request)
             request.stream = receiver
+            # 请求受理时固定异常映射策略版本
+            self.protocol.app.error_handler.request_policy(request)
 
             self.receivers[event.stream_id] = receiver
             return receiver, True

@@ -128,6 +128,7 @@ class Request(Generic[sanic_type, ctx_type]):
         "stream",
         "transport",
         "version",
+        "error_policy",
     )
 
     def __init__(
@@ -188,6 +189,8 @@ class Request(Generic[sanic_type, ctx_type]):
         self.stream: Stream | None = None
         self._match_info: dict[str, Any] = {}
         self._protocol: BaseProtocol | None = None
+        # 请求受理时固定的异常映射策略版本；未配置版本的项目恒为 None
+        self.error_policy: Any = None
 
     def __repr__(self):
         class_name = self.__class__.__name__
