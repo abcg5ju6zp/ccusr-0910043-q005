@@ -109,6 +109,7 @@ class Request(Generic[sanic_type, ctx_type]):
         "app",
         "body",
         "conn_info",
+        "error_policy",
         "head",
         "headers",
         "method",
@@ -188,6 +189,13 @@ class Request(Generic[sanic_type, ctx_type]):
         self.stream: Stream | None = None
         self._match_info: dict[str, Any] = {}
         self._protocol: BaseProtocol | None = None
+        # 受理时固定此刻已发布的异常映射策略版本；整个请求生命周期
+        # （含处理器二次抛错、超时/取消、审计）都引用这一不可变快照。
+        # 未发布过版本的应用得到 None，回退到历史查找顺序。
+        error_handler = getattr(app, "error_handler", None)
+        self.error_policy = (
+            error_handler.pin_policy() if error_handler else None
+        )
 
     def __repr__(self):
         class_name = self.__class__.__name__

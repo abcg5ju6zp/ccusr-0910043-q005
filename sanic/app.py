@@ -464,16 +464,42 @@ class Sanic(
         self,
         handler: FutureException,
         route_names: list[str] | None = None,
+        blueprint: str | None = None,
     ):
         """项目内部接口说明。"""
 
         for exception in handler.exceptions:
             if isinstance(exception, (tuple, list)):
                 for e in exception:
-                    self.error_handler.add(e, handler.handler, route_names)
+                    self.error_handler.add(
+                        e,
+                        handler.handler,
+                        route_names,
+                        blueprint=blueprint,
+                    )
             else:
-                self.error_handler.add(exception, handler.handler, route_names)
+                self.error_handler.add(
+                    exception,
+                    handler.handler,
+                    route_names,
+                    blueprint=blueprint,
+                )
         return handler.handler
+
+    # ------------------------------------------------------------------ #
+    # Error policy versions
+    # ------------------------------------------------------------------ #
+    def publish_error_policy(self, version: str):
+        """冻结当前异常映射草稿为不可变版本并原子发布。
+
+        发布只影响此后新受理的请求；已在处理流程中的请求继续使用
+        受理时固定的旧版本快照。
+        """
+        return self.error_handler.publish_policy(version)
+
+    def rollback_error_policy(self, version: str | None = None):
+        """回滚异常映射策略版本；仅影响此后新受理的请求。"""
+        return self.error_handler.rollback_policy(version)
 
     def _apply_listener(self, listener: FutureListener):
         return self.register_listener(
@@ -845,6 +871,19 @@ class Sanic(
     # Request Handling
     # -------------------------------------------------------------------- #
 
+    def _audit_outer_failure(
+        self,
+        request: Request,
+        exception: BaseException,
+        response: BaseHTTPResponse,
+    ) -> None:
+        """错误处理在最后兜底分支失败时也落一条同版本审计记录。"""
+        error_handler = self.error_handler
+        record = error_handler.resolve(request, exception)[1]
+        record.reason = "outer_failure"
+        error_handler.stamp(response, record)
+        error_handler.audit(request, exception, record)
+
     async def handle_exception(
         self,
         request: Request,
@@ -876,9 +915,13 @@ class Sanic(
                 "has at least partially been sent."
             )
 
-            handler = self.error_handler._lookup(
-                exception, request.name if request else None
-            )
+            # 流式响应已提交：响应无法改写，但仍按请求受理时固定的
+            # 策略版本解析，并落一条 delivered=False 的审计记录，保证
+            # 审计与该请求的版本引用确定、可核对。
+            handler, record = self.error_handler.resolve(request, exception)
+            record.delivered = False
+            record.reason = "response_committed"
+            self.error_handler.audit(request, exception, record)
             if handler:
                 logger.warning(
                     "An error occurred while handling the request after at "
@@ -930,6 +973,7 @@ class Sanic(
                     response = HTTPResponse(
                         "An error occurred while handling an error", status=500
                     )
+                self._audit_outer_failure(request, e, response)
         if response is not None:
             try:
                 request.reset_response()

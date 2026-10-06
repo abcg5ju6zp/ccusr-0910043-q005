@@ -369,7 +369,9 @@ class Blueprint(BaseSanic):
                 if (self, future) in app._future_registry:
                     continue
                 exception_handlers.append(
-                    app._apply_exception_handler(future, route_names)
+                    app._apply_exception_handler(
+                        future, route_names, blueprint=self.name
+                    )
                 )
 
         # Event listeners
